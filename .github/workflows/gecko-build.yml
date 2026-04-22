@@ -1,0 +1,109 @@
+name: Build Gecko Engine
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - engine/release.txt
+      - patches/**
+
+jobs:
+  build-gecko:
+    name: Build Gecko for iOS
+    runs-on: macos-15
+    timeout-minutes: 600
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Gecko 릴리즈 태그 읽기
+        id: gecko-tag
+        run: |
+          tag=$(tr -d '\000\r' < engine/release.txt | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building Gecko: $tag"
+
+      - name: 기존 Gecko 릴리즈 체크
+        id: check-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="gecko-${{ steps.gecko-tag.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists, skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rust 설치
+        if: steps.check-release.outputs.exists != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Firefox 서브모듈 초기화
+        if: steps.check-release.outputs.exists != 'true'
+        run: |
+          git submodule update --init --depth 1 engine/firefox
+          tag="${{ steps.gecko-tag.outputs.tag }}"
+          git -C engine/firefox fetch --depth 1 origin tag "$tag"
+          git -C engine/firefox checkout --detach "refs/tags/$tag^{commit}"
+
+      - name: Gecko 패치 적용
+        if: steps.check-release.outputs.exists != 'true'
+        run: |
+          find patches -name '*.patch' | sort | while read -r patch; do
+            echo "Applying $patch..."
+            git -C engine/firefox apply --3way --whitespace=nowarn "$patch"
+          done
+
+      - name: Gecko 빌드 의존성 설치
+        if: steps.check-release.outputs.exists != 'true'
+        run: |
+          brew install autoconf@2.13 nasm yasm || true
+          cargo install cbindgen || true
+          pip3 install zstandard six
+
+      - name: Gecko 빌드
+        if: steps.check-release.outputs.exists != 'true'
+        run: |
+          cat > engine/firefox/.mozconfig << 'EOF'
+          ac_add_options --enable-application=mobile/ios
+          ac_add_options --target=aarch64-apple-ios
+          ac_add_options --enable-ios-target=14.0
+          ac_add_options --enable-optimize
+          ac_add_options --disable-debug
+          ac_add_options --disable-tests
+          EOF
+          cd engine/firefox
+          ./mach build
+
+      - name: Gecko dist 압축
+        if: steps.check-release.outputs.exists != 'true'
+        run: |
+          GECKO_VERSION="${{ steps.gecko-tag.outputs.tag }}"
+          tar -C engine/firefox/obj-aarch64-apple-ios -czf "gecko-dist-${GECKO_VERSION}.tar.gz" dist/
+          echo "Archive size: $(du -sh gecko-dist-${GECKO_VERSION}.tar.gz | cut -f1)"
+
+      - name: Gecko dist를 Release에 업로드
+        if: steps.check-release.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GECKO_VERSION="${{ steps.gecko-tag.outputs.tag }}"
+          RELEASE_TAG="gecko-${GECKO_VERSION}"
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Gecko Engine: $GECKO_VERSION" \
+            --notes "Pre-built Gecko dist for iOS (aarch64). Used by the app build workflow." \
+            --prerelease \
+            "gecko-dist-${GECKO_VERSION}.tar.gz"
